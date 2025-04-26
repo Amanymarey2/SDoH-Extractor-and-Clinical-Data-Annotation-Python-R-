@@ -1,0 +1,250 @@
+---
+title: "Clinical Data Annotation in R"
+output: html_document
+date: "2025-04-24"
+---
+
+```{r}
+#install packages
+
+library(readr)       #read csv
+library(splitstackshape)       # split columns
+library(caTools)     #split data to train and test
+library(jsonlite)  #export to json
+library(stringr)  #text manipulation
+```
+
+###1- import synthetic data
+
+```{r}
+#import csv data
+data <- read_csv("synthetic_notes_labelled.csv")
+head(data)
+```
+
+###2- Data Preparartion
+
+The first step in data preparartion is cleaning "sdoh" column by separating labels and entities
+
+```{r}
+#split sdoh column by comma
+data <- cSplit(data, "sdoh", sep = ",")
+
+#Rename new columns
+colnames(data)[5:12] <- c("label1", "entity1","label2","entity2", "label3", "entity3",  "label4", "entity4")
+head(data)
+```
+
+The second step is cleaning the text by extracting entity and labels
+
+```{r}
+#helper function to extract labels only
+clean_labels <- function(x) {
+  x <- gsub(".*'label': '([^']+)'.*" , "\\1", x)
+}
+
+#helper function to extract entities only
+clean_entities <- function(x) {
+  x <- gsub(".*'entity': '([^']+)'.*" , "\\1", x)
+}
+
+#Apply functions
+data[,5:12] <- lapply(data[,5:12], clean_labels)
+data[,5:12] <- lapply(data[,5:12], clean_entities)
+
+head(data)
+```
+
+
+###3- Data Annotation 
+
+The maximum entities in our data is 4. Therefore, some steps will be repeated 5 times. To annotate data, we have to find the start and end span of entity. The helper function using gregexpr detects the start span. The function is adapted to skip NA for notes with entities less than 4.
+
+```{r}
+#start position function
+
+startPos <- function(note, word) {
+  # Check for NA or empty string in word or note
+  if (is.na(word) || word == "" || is.na(note) || note == "") {
+    return(NA)
+  }
+  
+  # Safe pattern match
+  match <- gregexpr(word, note, ignore.case = FALSE)[[1]][1]
+  if (match == -1) NA else match
+}
+ 
+# Find start position of the word
+data$start_pos1 <- mapply(startPos, data$note, data$entity1) -1
+data$start_pos2 <- mapply(startPos, data$note, data$entity2) -1
+data$start_pos3 <- mapply(startPos, data$note, data$entity3) -1
+data$start_pos4 <- mapply(startPos, data$note, data$entity4) -1
+
+
+
+# Calculate end position
+data$end_pos1 <- data$start_pos1 + nchar(data$entity1) 
+data$end_pos2 <- data$start_pos2 + nchar(data$entity2) 
+data$end_pos3 <- data$start_pos3 + nchar(data$entity3) 
+data$end_pos4 <- data$start_pos4 + nchar(data$entity4) 
+
+```
+
+
+In this step, we will combine all entities in one column with removing NA entries 
+
+
+```{r}
+#paste start span, end span and label
+
+data$annotation <- paste("(", data$note, ",", "{'entities': [(", data$start_pos1, ",", data$end_pos1, ",", data$label1, ")",", (", data$start_pos2, ",", data$end_pos2, ",", data$label2, ")",", (", data$start_pos3, ",", data$end_pos3, ",", data$label3, ")", ", (", data$start_pos4, ",", data$end_pos4, ",", data$label4, ")" )
+
+# Remove all ( NA , NA , NA ) entries (with optional spaces and trailing commas)
+data$annotation <- gsub("\\(\\s*NA\\s*,\\s*NA\\s*,\\s*NA\\s*\\)\\s*,?", "", data$annotation)
+
+# Optional: clean up any leftover ", ]" or trailing commas
+data$annotation <- gsub(",\\s*\\]", "]", data$annotation)
+data$annotation <- gsub(",\\s*\\}", "}", data$annotation)
+
+# Replace trailing comma after last entity with closing parenthesis
+data$annotation <- sub(",\\s*$", " ]})", data$annotation)
+
+head(data)
+```
+
+
+###4- Split data set into train and test samples 
+
+
+```{r}
+#make this example reproducible
+set.seed(1)
+
+#use 70% of dataset as training set and 30% as test set
+sample <- sample.split(data$annotation, SplitRatio = 0.7)
+train  <- subset(data, sample == TRUE)
+test   <- subset(data, sample == FALSE)
+```
+
+
+###5- Data processing for spaCy training format
+
+
+```{r}
+ remove_overlaps <- function(entities) {
+  if (length(entities) <= 1) return(entities)  # Nothing to overlap
+
+  # Sort entities by start, then by descending span length
+  sorted <- entities[order(
+    sapply(entities, `[[`, 1), 
+    -sapply(entities, function(e) e[[2]] - e[[1]])
+  )]
+
+  result <- list()
+  for (e in sorted) {
+    overlap <- any(sapply(result, function(r) {
+      (e[[1]] < r[[2]] && e[[2]] > r[[1]])
+    }))
+    if (!overlap) result <- append(result, list(e))
+  }
+  return(result)
+}
+
+# Function to process each annotation entry
+parse_annotation <- function(entry) {
+  # Extract the main text
+  text <- str_match(entry, "^\\(\\s*(.*?)\\s*,\\s*\\{")[,2]
+
+  # Extract entity matches (start, end, label)
+  entity_pattern <- "\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*([A-Z_]+)\\s*\\)"
+  entity_matches <- str_match_all(entry, entity_pattern)[[1]]
+
+  if (nrow(entity_matches) == 0) {
+    return(list(text, list(entities = list())))
+  }
+
+ 
+  
+  # Format the entities into a list of lists
+raw_entities <- lapply(seq_len(nrow(entity_matches)), function(i) {
+  start <- as.integer(entity_matches[i, 2])
+  end <- as.integer(entity_matches[i, 3])
+  label <- entity_matches[i, 4]
+  list(start, end, label)
+})
+
+entities <- remove_overlaps(raw_entities)
+
+
+  # Return in spaCy training format
+  list(text, list(entities = entities))
+}
+
+```
+
+
+###6- Apply function and export data
+
+
+```{r}
+# Apply to all train rows
+json_train <- lapply(train$annotation, parse_annotation)
+
+# Export to JSON
+write_json(json_train, "train_data.json", auto_unbox = TRUE, pretty = TRUE)
+
+
+# Apply to all test rows
+json_test <- lapply(test$annotation, parse_annotation)
+
+# Export to JSON
+write_json(json_test, "test_data.json", auto_unbox = TRUE, pretty = TRUE)
+```
+
+###7- Validate span alignment
+
+```{r}
+
+# Function to validate span alignment
+validate_spans <- function(entry) {
+  # Extract the main text
+  text <- str_match(entry, "^\\(\\s*(.*?)\\s*,\\s*\\{")[,2]
+
+  # Extract entity matches
+  entity_pattern <- "\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*([A-Z_]+)\\s*\\)"
+  entity_matches <- str_match_all(entry, entity_pattern)[[1]]
+
+  if (nrow(entity_matches) == 0) return(NULL)
+
+  # Check each span against actual substring
+  for (i in 1:nrow(entity_matches)) {
+    start <- as.integer(entity_matches[i, 2])
+    end <- as.integer(entity_matches[i, 3])
+    label <- entity_matches[i, 4]
+    
+    # Extract substring
+    extracted <- substr(text, start + 1, end)  # R is 1-based, Python is 0-based
+    cat(sprintf("Entity: %-15s | Span: (%3d, %3d) | Text: \"%s\"\n", label, start, end, extracted))
+  }
+}
+
+# Example: check first few entries
+for (i in 1:3) {
+  cat(sprintf("\n--- Entry %d ---\n", i))
+  validate_spans(train$annotation[i])
+}
+
+```
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
